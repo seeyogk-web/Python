@@ -14,6 +14,86 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 test_bp = Blueprint("test", __name__)
 
+
+def _ensure_candidate_taken_table(conn):
+    """Ensure the candidate_test_taken table exists."""
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_test_taken (
+                id SERIAL PRIMARY KEY,
+                candidate_id VARCHAR(255) NOT NULL,
+                job_id VARCHAR(255),
+                question_set_id VARCHAR(255) NOT NULL,
+                cid VARCHAR(255),
+                taken_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        # create an index to speed up lookups
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS candidate_test_taken_unique_idx
+            ON candidate_test_taken (candidate_id, job_id, question_set_id)
+        """)
+        # Ensure columns exist on older schemas: add cid, job_id, taken_at if missing
+        try:
+            cur.execute("ALTER TABLE candidate_test_taken ADD COLUMN IF NOT EXISTS cid VARCHAR(255)")
+            cur.execute("ALTER TABLE candidate_test_taken ADD COLUMN IF NOT EXISTS job_id VARCHAR(255)")
+            cur.execute("ALTER TABLE candidate_test_taken ADD COLUMN IF NOT EXISTS taken_at TIMESTAMPTZ DEFAULT NOW()")
+        except Exception:
+            # non-fatal: continue if ALTER fails for any reason
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        if cur: cur.close()
+
+
+@test_bp.route("/test/taken", methods=["GET"])
+def taken_tests():
+    """Return a list of taken tests (job_id, question_set_id) for a candidate.
+
+    Query parameters:
+      - candidate_id or cid
+    """
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        _ensure_candidate_taken_table(conn)
+        candidate_id = request.args.get('candidate_id') or request.args.get('cid')
+        if not candidate_id:
+            return jsonify({'error': 'candidate_id (or cid) required'}), 400
+
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT job_id, question_set_id, cid, taken_at FROM candidate_test_taken WHERE candidate_id = %s OR cid = %s",
+            (candidate_id, candidate_id)
+        )
+        rows = cur.fetchall()
+        taken = []
+        for r in rows:
+            job_id, question_set_id, cid_val, taken_at = r
+            taken.append({
+                'job_id': job_id,
+                'question_set_id': question_set_id,
+                'cid': cid_val,
+                'taken_at': taken_at.isoformat() if hasattr(taken_at, 'isoformat') else taken_at,
+            })
+        return jsonify({'taken': taken}), 200
+    except Exception as e:
+        print('🔥 taken_tests error:', e)
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if cur: cur.close()
+        if conn: conn.close()
 # ==============================================
 # Start Test
 # ==============================================
@@ -23,6 +103,32 @@ def start_test(question_set_id):
     cursor = None
     try:
         conn = get_db_connection()
+        # If candidate_id provided, ensure candidate hasn't already taken this test
+        candidate_id = request.args.get("candidate_id") or request.args.get("cid")
+        job_id = request.args.get("job_id") or request.args.get("jobId")
+        if candidate_id:
+            try:
+                _ensure_candidate_taken_table(conn)
+                chk_cur = conn.cursor()
+                if job_id:
+                    chk_cur.execute(
+                        "SELECT 1 FROM candidate_test_taken WHERE candidate_id = %s AND question_set_id = %s AND job_id = %s LIMIT 1",
+                        (candidate_id, question_set_id, job_id)
+                    )
+                else:
+                    chk_cur.execute(
+                        "SELECT 1 FROM candidate_test_taken WHERE candidate_id = %s AND question_set_id = %s LIMIT 1",
+                        (candidate_id, question_set_id)
+                    )
+                row = chk_cur.fetchone()
+                chk_cur.close()
+                if row:
+                    return jsonify({"error": "Test already taken"}), 403
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -265,12 +371,19 @@ def attempt_detail(attempt_id):
 @test_bp.route("/test/save_violations", methods=["POST"])
 def save_violations():
     data = request.get_json() or {}
+    print("save_violations called")
+    try:
+        print("Request JSON:", data)
+    except Exception:
+        print("Request JSON (non-serializable):", data)
     candidate_id = data.get("candidate_id")
     question_set_id = data.get("question_set_id")
     tab_switches = data.get("tab_switches", 0)
     inactivities = data.get("inactivities", 0)
     face_not_visible = data.get("face_not_visible", 0)
     cid = data.get("cid")
+
+    print(f"Parsed: candidate_id={candidate_id} question_set_id={question_set_id} tab_switches={tab_switches} inactivities={inactivities} face_not_visible={face_not_visible} cid={cid}")
 
     if not candidate_id or not question_set_id:
         return jsonify({"error": "candidate_id and question_set_id required"}), 400
@@ -338,19 +451,59 @@ def save_violations():
                     cur.execute("""
                         INSERT INTO test_attempts (
                             candidate_id, question_set_id,
-                            tab_switches, inactivities, face_not_visible
-                        ) VALUES (%s, %s, %s, %s, %s)
+                            tab_switches, inactivities, face_not_visible, cid
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
                     """, (
                         candidate_id,
                         question_set_id,
                         tab_switches,
                         inactivities,
-                        face_not_visible
+                        face_not_visible,
+                        cid
                     ))
             else:
                 raise
 
         conn.commit()
+        try:
+            print("test_attempts updated/inserted; committed. Current tab_switches:", tab_switches)
+        except Exception:
+            pass
+        # Mark test as completed so candidate cannot retake.
+        # Insert into candidate_test_taken unconditionally (based on this violations call),
+        # avoiding duplicates by checking existence first.
+        try:
+            try:
+                _ensure_candidate_taken_table(conn)
+                ins_cur = conn.cursor()
+                job_id = data.get("job_id") or data.get("jobId")
+                ins_cur.execute(
+                    "SELECT 1 FROM candidate_test_taken WHERE (candidate_id = %s OR cid = %s) AND question_set_id = %s LIMIT 1",
+                    (candidate_id, cid, question_set_id)
+                )
+                exists = ins_cur.fetchone()
+                if not exists:
+                    ins_cur.execute(
+                        "INSERT INTO candidate_test_taken (candidate_id, job_id, question_set_id, cid) VALUES (%s, %s, %s, %s)",
+                        (candidate_id, job_id, question_set_id, cid)
+                    )
+                    conn.commit()
+                    print(f"Inserted candidate_test_taken: candidate_id={candidate_id} job_id={job_id} question_set_id={question_set_id} cid={cid}")
+                else:
+                    print("candidate_test_taken entry already exists for candidate/question_set; no insert performed.")
+                try:
+                    ins_cur.close()
+                except Exception:
+                    pass
+            except Exception as ex_ins:
+                print("Error while inserting into candidate_test_taken:", ex_ins)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return jsonify({"message": "Violations updated"}), 200
 
     except Exception as e:
@@ -941,6 +1094,57 @@ def submit_section(question_set_id=None):
                 raise
 
         conn.commit()
+
+        # Optionally mark test as completed for this candidate so they cannot retake
+        try:
+            mark_complete = data.get("mark_complete") or data.get("final") or data.get("is_last_section")
+            job_id = data.get("job_id") or data.get("jobId")
+            if mark_complete:
+                try:
+                    print('submit_section: mark_complete detected; details ->', {
+                        'candidate_id': candidate_id,
+                        'cid': cid,
+                        'question_set_id': question_set_id,
+                        'job_id': job_id,
+                        'mark_complete': mark_complete,
+                        'data_keys': list(data.keys())
+                    })
+                    _ensure_candidate_taken_table(conn)
+                    chk = conn.cursor()
+                    # Insert only if not already present for this candidate (or cid) and question_set
+                    chk.execute(
+                        "SELECT 1 FROM candidate_test_taken WHERE (candidate_id = %s OR cid = %s) AND question_set_id = %s LIMIT 1",
+                        (candidate_id, cid, question_set_id)
+                    )
+                    exists = chk.fetchone()
+                    if not exists:
+                        try:
+                            chk.execute(
+                                "INSERT INTO candidate_test_taken (candidate_id, job_id, question_set_id, cid) VALUES (%s, %s, %s, %s)",
+                                (candidate_id, job_id, question_set_id, cid)
+                            )
+                            conn.commit()
+                            print(f"Inserted candidate_test_taken: candidate_id={candidate_id} job_id={job_id} question_set_id={question_set_id} cid={cid}")
+                        except Exception as ins_ex:
+                            print('submit_section: insert into candidate_test_taken failed:', ins_ex)
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                    else:
+                        print('submit_section: candidate_test_taken entry already exists for candidate/question_set; no insert performed.')
+                    try:
+                        chk.close()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print('submit_section: error while handling mark_complete ->', e)
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
         return jsonify({"message": "Section stored", "evaluations": results_out}), 200
 
