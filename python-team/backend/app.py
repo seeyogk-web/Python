@@ -12,9 +12,9 @@ def create_app():
     CORS(app, resources={r"/*": {"origins": "*"}})
 
     # Register blueprints
-    app.register_blueprint(questions_bp, url_prefix="/api/v1")
-    app.register_blueprint(skills_bp, url_prefix="/api/v1")
-    app.register_blueprint(test_bp, url_prefix="/api/v1")   # ✅ register test routes
+    app.register_blueprint(questions_bp, url_prefix="/ai/v1")
+    app.register_blueprint(skills_bp, url_prefix="/ai/v1")
+    app.register_blueprint(test_bp, url_prefix="/ai/v1")   # ✅ register test routes
 
     @app.route("/")
     def home():

@@ -1,6 +1,16 @@
 import requests
 import json
+import re
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from config import OPENROUTER_API_KEY, OPENROUTER_URL, OPENROUTER_MODEL
+
+# Create a session with retries to avoid repeating code and improve resilience
+_session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.5, status_forcelist=(429, 500, 502, 503, 504))
+adapter = HTTPAdapter(max_retries=retries)
+_session.mount("https://", adapter)
+_session.mount("http://", adapter)
 
 PROMPTS = {
     "mcq": (
@@ -24,8 +34,32 @@ PROMPTS = {
     ),
 }
 
+def _extract_json_from_text(text: str):
+    """Try to extract the first JSON object from a string.
+    Falls back to returning None if no JSON is found.
+    """
+    if not text:
+        return None
+    # Quick attempt: if text looks like JSON already
+    text = text.strip()
+    if (text.startswith("{") and text.endswith("}")) or (text.startswith("[") and text.endswith("]")):
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+    # Search for the first {...} block
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    return None
+
+
 def generate_question(skill: str, difficulty: str, qtype: str, options: int = 4):
-    prompt_text = PROMPTS[qtype].format(skill=skill, difficulty=difficulty, options=options)
+    prompt_text = PROMPTS.get(qtype, PROMPTS.get("mcq")).format(skill=skill, difficulty=difficulty, options=options)
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -42,27 +76,33 @@ def generate_question(skill: str, difficulty: str, qtype: str, options: int = 4)
         "max_tokens": 600
     }
 
-    resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
+    resp = _session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     data = resp.json()
 
+    content = None
     try:
         content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
     except Exception:
+        # return a minimal failure payload for caller to handle
         return {"question": "Bad LLM response", "options": [], "correct_answer": None}
+
+    parsed = _extract_json_from_text(content)
+    if parsed is None:
+        # return raw content so caller can attempt to handle it
+        return {"raw": content}
 
     # NORMALIZE OUTPUT HERE
     if qtype == "mcq":
         return {
-            "question": parsed.get("prompt"),
+            "question": parsed.get("prompt") or parsed.get("question") or parsed.get("prompt_text"),
             "options": parsed.get("options", []),
-            "correct_answer": parsed.get("answer")   # A/B/C/D
+            "correct_answer": parsed.get("answer") or parsed.get("correct_answer")
         }
 
     if qtype == "coding":
         return {
-            "question": parsed.get("prompt"),
+            "question": parsed.get("prompt") or parsed.get("question"),
             "input_spec": parsed.get("input_spec"),
             "output_spec": parsed.get("output_spec"),
             "examples": parsed.get("examples", [])
@@ -70,14 +110,14 @@ def generate_question(skill: str, difficulty: str, qtype: str, options: int = 4)
 
     if qtype == "audio":
         return {
-            "question": parsed.get("prompt_text"),
+            "prompt_text": parsed.get("prompt_text") or parsed.get("prompt"),
             "expected_keywords": parsed.get("expected_keywords", []),
             "rubric": parsed.get("rubric")
         }
 
     if qtype == "video":
         return {
-            "question": parsed.get("prompt_text"),
+            "prompt_text": parsed.get("prompt_text") or parsed.get("prompt"),
             "rubric": parsed.get("rubric"),
             "suggested_time_seconds": parsed.get("suggested_time_seconds", 60)
         }
@@ -129,12 +169,13 @@ def evaluate_answer(question_type: str, question_text: str, correct_answer: str,
         "max_tokens": 400
     }
 
-    resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
+    resp = _session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     data = resp.json()
 
     try:
         content = data["choices"][0]["message"]["content"]
-        return json.loads(content)
+        parsed = _extract_json_from_text(content)
+        return parsed if parsed is not None else {"raw": content}
     except Exception:
         return {"raw": content}
