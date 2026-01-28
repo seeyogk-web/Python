@@ -86,6 +86,80 @@ def get_finalized_test():
         if conn:
             conn.close()
 
+@questions_bp.route("/question-set/<question_set_id>/assessment", methods=["GET"])
+def get_assessment_by_qset(question_set_id):
+    """Return basic assessment metadata (title, role_title, company) for a question_set_id."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT title, role_title, company FROM assessment_questions WHERE question_set_id = %s LIMIT 1", (question_set_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"status": "error", "message": "Not found"}), 404
+
+        title, role_title, company = row
+        return jsonify({
+            "status": "success",
+            "title": title,
+            "role_title": role_title,
+            "company": company
+        }), 200
+    except Exception as e:
+        print(f"Error fetching assessment metadata: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
+
+@questions_bp.route("/finalise/finalized-tests", methods=["GET"])
+def get_all_finalized_tests():
+    """Return all finalized tests (no candidateId filter)."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT title, work_type, created_at, candidate_id, job_id, company, skills, location, question_set_id, exam_date, end_date, test_end, test_start
+            FROM assessment_questions
+        """)
+        rows = cur.fetchall()
+        out = []
+        for row in rows:
+            # parse skills into list when stored as comma-separated string
+            skills_val = row[6]
+            if skills_val:
+                if isinstance(skills_val, str):
+                    skills_list = [s.strip() for s in skills_val.split(",") if s.strip()]
+                else:
+                    skills_list = skills_val if isinstance(skills_val, list) else []
+            else:
+                skills_list = []
+
+            out.append({
+                "title": row[0],
+                "workType": row[1],
+                "createdAt": row[2].isoformat() if row[2] else None,
+                "candidate_id": row[3],
+                "job_id": row[4],
+                "company": row[5],
+                "skills": skills_list,
+                "location": row[7],
+                "question_set_id": row[8],
+                "exam_date": row[9],
+                "end_date": row[10],
+                "test_end": row[11],
+                "test_start": row[12]
+            })
+
+        return jsonify(out), 200
+    except Exception as e:
+        print("Error fetching all assessments:", e)
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
+
 @questions_bp.route("/generate-test", methods=["POST"])
 def generate_test():
     """Generate questions based on skill selections"""
