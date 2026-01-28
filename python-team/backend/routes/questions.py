@@ -86,6 +86,31 @@ def get_finalized_test():
         if conn:
             conn.close()
 
+@questions_bp.route("/finalise/finalized-test/<question_set_id>", methods=["DELETE"])
+def delete_finalized_test(question_set_id):
+    """Delete an assessment by question_set_id."""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Delete from assessment_questions; consider cascade or manual deletions if other tables reference it
+        cur.execute("""
+            DELETE FROM assessment_questions WHERE question_set_id = %s
+        """, (question_set_id,))
+        deleted = cur.rowcount
+        conn.commit()
+        if deleted:
+            return jsonify({"message": "Deleted"}), 200
+        else:
+            return jsonify({"error": "Not found"}), 404
+    except Exception as e:
+        print("Error deleting assessment:", e)
+        if conn:
+            conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        if conn: conn.close()
+
 @questions_bp.route("/question-set/<question_set_id>/assessment", methods=["GET"])
 def get_assessment_by_qset(question_set_id):
     """Return basic assessment metadata (title, role_title, company) for a question_set_id."""
