@@ -1,4 +1,5 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_from_directory
+import re
 from config import get_db_connection
 from services.llm_client import evaluate_answer
 import os
@@ -12,7 +13,125 @@ from werkzeug.utils import secure_filename
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "recordings")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+def full_media_url(path):
+    """Return an absolute URL for a media path stored in DB.
+
+    - If `path` is already absolute (http/https) return as-is.
+    - If `path` starts with `/` prepend the request host_url.
+    - Otherwise prepend host_url and a slash.
+    Returns None for falsy `path`.
+    """
+    if not path:
+        print(f"full_media_url: input is falsy -> {path}")
+        return None
+    try:
+        # already absolute
+        if path.startswith("http://") or path.startswith("https://"):
+            print(f"full_media_url: already absolute -> {path}")
+            return path
+    except Exception:
+        pass
+
+    # Include the application's script_root (mounting/blueprint prefix) so
+    # generated URLs point to the correct mounted path (e.g. /ai/v1).
+    script_root = (request.script_root or "").rstrip("/")
+    # If script_root is not set (some environments), try to infer the prefix
+    # from the request path (take everything before '/test'). This handles
+    # cases where the blueprint is mounted under a prefix like '/ai/v1'.
+    if not script_root:
+        try:
+            m = re.search(r'^(.*?)/test(/|$)', request.path)
+            if m:
+                script_root = m.group(1).rstrip("/")
+        except Exception:
+            script_root = ""
+
+    host = request.host_url.rstrip("/")
+    base = f"{host}{script_root}"
+    if path.startswith("/"):
+        resolved = f"{base}{path}"
+        print(f"full_media_url: resolved -> {resolved}")
+        return resolved
+    resolved = f"{base}/{path}"
+    print(f"full_media_url: resolved -> {resolved}")
+    return resolved
+
 test_bp = Blueprint("test", __name__)
+
+
+@test_bp.route(f"/{UPLOAD_DIR}/<path:filename>", methods=["GET"])
+@test_bp.route("ai/recordings/<path:filename>", methods=["GET"])
+def serve_recording(filename):
+    """Serve uploaded recordings from the backend `recordings` folder.
+
+    Supports both `/recordings/<file>` and `/ai/recordings/<file>` URL shapes.
+    """
+    folder = os.path.abspath(UPLOAD_DIR)
+    full_path = os.path.join(folder, filename)
+    try:
+        exists = os.path.exists(full_path)
+        print(f"serve_recording request -> folder={folder} filename={filename} exists={exists}")
+        if not exists:
+            print("serve_recording: file not found on disk:", full_path)
+            return jsonify({"error": "File not found", "path": full_path}), 404
+        return send_from_directory(folder, filename)
+    except Exception as e:
+        print("🔥 serve_recording error:", e)
+        return jsonify({"error": "File not found"}), 404
+
+
+@test_bp.route("/test/video_url", methods=["GET"])
+def get_video_url_for_attempt():
+    """Return a full video URL for an attempt by `attempt_id` or `candidate_id` query param.
+
+    Query params accepted: `attempt_id`, `candidate_id`, `candidateId`.
+    """
+    attempt_id = (
+        request.args.get("attempt_id")
+        or request.args.get("candidate_id")
+        or request.args.get("candidateId")
+    )
+    if not attempt_id:
+        return jsonify({"error": "attempt_id or candidate_id required"}), 400
+
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Compare `id` as text to avoid invalid UUID cast when a candidate_id-style
+        # string (e.g. 'candidate_...') is provided. This prevents Postgres from
+        # throwing "invalid input syntax for type uuid" errors.
+        cur.execute(
+            "SELECT video_url FROM test_attempts WHERE id::text = %s OR candidate_id = %s LIMIT 1",
+            (attempt_id, attempt_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"video_url": None}), 200
+
+        video_path = row[0]
+        resolved = full_media_url(video_path)
+        print(f"get_video_url: attempt_id={attempt_id} video_path={video_path} resolved={resolved}")
+        return jsonify({"video_url": resolved}), 200
+
+    except Exception as e:
+        print("🔥 get_video_url error:", e)
+        return jsonify({"error": str(e)}), 500
+
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 
 
 def _ensure_candidate_taken_table(conn):
@@ -545,6 +664,7 @@ def upload_audio():
         save_path = os.path.join(UPLOAD_DIR, safe)
         audio_file.save(save_path)
         audio_url = f"/{UPLOAD_DIR}/{safe}"
+        print(f"upload_audio: saved -> {save_path} audio_url={audio_url}")
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -655,6 +775,7 @@ def upload_video():
         save_path = os.path.join(UPLOAD_DIR, final_name)
         video_file.save(save_path)
         video_url = f"/{UPLOAD_DIR}/{final_name}"
+        print(f"upload_video: saved -> {save_path} video_url={video_url}")
 
         conn = get_db_connection()
         cur = conn.cursor()
