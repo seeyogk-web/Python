@@ -1,8 +1,11 @@
 import re
 import uuid
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from services.llm_client import generate_question
+
+logger = logging.getLogger(__name__)
 
 
 def generate_questions(payload):
@@ -52,12 +55,15 @@ def generate_questions(payload):
         while attempts < 5:
             attempts += 1
             try:
+                logger.debug(f"Attempt {attempts}/5: Generating {qtype} for skill={name}, difficulty={difficulty}")
                 q_data = generate_question(skill=name, difficulty=difficulty, qtype=qtype, options=options)
-            except Exception:
+            except Exception as e:
+                logger.error(f"Exception in generate_question (attempt {attempts}): {str(e)}")
                 q_data = None
 
             if q_data is None:
                 # fallback content
+                logger.warning(f"generate_question returned None for {name}/{qtype}/{difficulty} (attempt {attempts}). Using fallback.")
                 if qtype == "audio":
                     q_data = {"prompt_text": f"Describe a situation where you used {name} effectively.", "type": "audio"}
                 elif qtype == "video":

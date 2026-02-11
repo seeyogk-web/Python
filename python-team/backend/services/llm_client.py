@@ -1,9 +1,12 @@
 import requests
 import json
 import re
+import logging
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from config import OPENROUTER_API_KEY, OPENROUTER_URL, OPENROUTER_MODEL
+
+logger = logging.getLogger(__name__)
 
 # Create a session with retries to avoid repeating code and improve resilience
 _session = requests.Session()
@@ -73,55 +76,85 @@ def generate_question(skill: str, difficulty: str, qtype: str, options: int = 4)
             {"role": "user", "content": prompt_text}
         ],
         "temperature": 0.3,
-        "max_tokens": 600
+        "max_tokens": 250
     }
 
-    resp = _session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
+    logger.info(f"Generating {qtype} question for skill={skill}, difficulty={difficulty}")
+    logger.debug(f"Using model: {OPENROUTER_MODEL}, URL: {OPENROUTER_URL}")
+    
+    try:
+        resp = _session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
+        logger.debug(f"API response status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            logger.error(f"API returned status {resp.status_code}: {resp.text}")
+            return None
+        
+        data = resp.json()
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network/Request error calling OpenRouter API: {str(e)}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse API response as JSON: {str(e)}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error in generate_question: {str(e)}")
+        return None
 
     content = None
     try:
         content = data["choices"][0]["message"]["content"]
-    except Exception:
-        # return a minimal failure payload for caller to handle
-        return {"question": "Bad LLM response", "options": [], "correct_answer": None}
+        logger.debug(f"Received content from API (first 100 chars): {content[:100]}")
+    except Exception as e:
+        logger.error(f"Failed to extract content from API response: {str(e)}")
+        logger.debug(f"API response structure: {json.dumps(data)}")
+        return None
 
     parsed = _extract_json_from_text(content)
     if parsed is None:
-        # return raw content so caller can attempt to handle it
-        return {"raw": content}
+        logger.warning(f"Could not extract JSON from API response for {qtype}")
+        logger.debug(f"Raw content: {content}")
+        return None
 
     # NORMALIZE OUTPUT HERE
     if qtype == "mcq":
-        return {
+        result = {
             "question": parsed.get("prompt") or parsed.get("question") or parsed.get("prompt_text"),
             "options": parsed.get("options", []),
             "correct_answer": parsed.get("answer") or parsed.get("correct_answer")
         }
+        logger.debug(f"MCQ generated: {result['question'][:80]}")
+        return result
 
     if qtype == "coding":
-        return {
+        result = {
             "question": parsed.get("prompt") or parsed.get("question"),
             "input_spec": parsed.get("input_spec"),
             "output_spec": parsed.get("output_spec"),
             "examples": parsed.get("examples", [])
         }
+        logger.debug(f"Coding question generated: {result['question'][:80]}")
+        return result
 
     if qtype == "audio":
-        return {
+        result = {
             "prompt_text": parsed.get("prompt_text") or parsed.get("prompt"),
             "expected_keywords": parsed.get("expected_keywords", []),
             "rubric": parsed.get("rubric")
         }
+        logger.debug(f"Audio question generated: {result['prompt_text'][:80]}")
+        return result
 
     if qtype == "video":
-        return {
+        result = {
             "prompt_text": parsed.get("prompt_text") or parsed.get("prompt"),
             "rubric": parsed.get("rubric"),
             "suggested_time_seconds": parsed.get("suggested_time_seconds", 60)
         }
+        logger.debug(f"Video question generated: {result['prompt_text'][:80]}")
+        return result
 
+    logger.debug(f"Parsed result: {parsed}")
     return parsed
 
 
