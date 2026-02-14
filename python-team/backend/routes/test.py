@@ -945,114 +945,48 @@ def submit_section(question_set_id=None):
                     evaluation = {"score": 0, "feedback": "Evaluation failed", "is_correct": False}
 
             elif qtype in ["audio", "video"]:
-                # Evaluate based on generated parameters (expected keywords, suggested time)
+                # Use LLM-based evaluation for audio/video answers
                 try:
-                    # Normalize candidate answer and extract transcript/duration if provided
                     transcript = ""
-                    duration = None
                     if isinstance(answer, dict):
                         transcript = answer.get("transcript") or answer.get("text") or ""
-                        duration = answer.get("duration_seconds") or answer.get("duration")
                     else:
-                        # may be JSON string
                         try:
                             parsed = json.loads(answer) if isinstance(answer, str) else None
                             if isinstance(parsed, dict):
                                 transcript = parsed.get("transcript") or parsed.get("text") or ""
-                                duration = parsed.get("duration_seconds") or parsed.get("duration")
                             else:
                                 transcript = str(answer or "")
                         except Exception:
                             transcript = str(answer or "")
 
-                    def _clean(s):
-                        return (s or "").lower()
-
-                    transcript_clean = _clean(transcript)
-
-                    # Parse expected keywords / params from `correct`
-                    expected_keywords = []
-                    suggested_time = None
-                    if isinstance(correct, dict):
-                        expected_keywords = correct.get("expected_keywords") or correct.get("keywords") or []
-                        suggested_time = correct.get("suggested_time_seconds") or correct.get("suggested_time")
+                    # Use llm_client.evaluate_answer for AI-based scoring
+                    from services.llm_client import evaluate_answer
+                    evaluation = evaluate_answer(
+                        question_type=qtype,
+                        question_text=qtext,
+                        correct_answer=correct,
+                        candidate_answer=transcript
+                    )
+                    # Optionally, normalize output for frontend compatibility
+                    if evaluation is None:
+                        evaluation = {"score": 0, "feedback": "Evaluation failed", "is_correct": False}
                     else:
-                        # attempt to parse JSON string or comma-separated keywords
-                        if isinstance(correct, str):
-                            try:
-                                parsed_c = json.loads(correct)
-                                if isinstance(parsed_c, dict):
-                                    expected_keywords = parsed_c.get("expected_keywords") or parsed_c.get("keywords") or []
-                                    suggested_time = parsed_c.get("suggested_time_seconds") or parsed_c.get("suggested_time")
-                                elif isinstance(parsed_c, list):
-                                    expected_keywords = parsed_c
-                            except Exception:
-                                # fallback: comma separated
-                                    expected_keywords = [k.strip() for k in correct.split(",") if k.strip()]
-
-                        # If expected_keywords is missing or placeholder (e.g. "N/A"), try to pull from question_meta
-                        try:
-                            meta = question_meta.get(str(qid)) or {}
-                            if (not expected_keywords) or (expected_keywords == ["N/A"]) or (isinstance(correct, str) and correct.strip().upper() == "N/A"):
-                                meta_kws = meta.get("expected_keywords") or meta.get("keywords") or []
-                                if meta_kws:
-                                    expected_keywords = meta_kws
-                            if not suggested_time:
-                                # try several keys used when questions are stored
-                                suggested_time = meta.get("suggested_time_seconds") or meta.get("suggested_time") or meta.get("suggested_time_seconds")
-                        except Exception:
-                            pass
-
-                    # Score keywords presence
-                    matches = 0
-                    total = max(1, len(expected_keywords))
-                    for kw in expected_keywords:
-                        kw_clean = (kw or "").lower()
-                        if not kw_clean:
-                            continue
-                        if kw_clean in transcript_clean:
-                            matches += 1
-
-                    keyword_score = matches / total if total > 0 else 0
-
-                    # Time score for video: only compute if both duration and suggested_time present
-                    time_score = None
-                    st = suggested_time if suggested_time is not None else (correct.get("suggested_time_seconds") if isinstance(correct, dict) else None)
-
-                    if duration is not None and st is not None:
-                        try:
-                            dur = float(duration)
-                            stf = float(st)
-                            # consider acceptable window 0.5x - 1.5x of suggested
-                            if 0.5 * stf <= dur <= 1.5 * stf:
-                                time_score = 1.0
+                        # Map LLM output to expected keys
+                        if "score" not in evaluation:
+                            # Try to extract score from possible keys
+                            if "is_correct" in evaluation:
+                                evaluation["score"] = 1 if evaluation["is_correct"] else 0
                             else:
-                                # penalize proportionally
-                                time_score = max(0.0, 1 - abs(dur - stf) / stf)
-                        except Exception:
-                            time_score = None
-
-                    # Combine scores: audio mostly keywords; video uses keyword + time (20% weight)
-                    if qtype == "audio":
-                        combined = keyword_score
-                    else:
-                        # If no time info available, rely only on keyword score
-                        if time_score is None:
-                            combined = 0.8 * keyword_score
-                        else:
-                            combined = 0.8 * keyword_score + 0.2 * time_score
-
-                    # For audio/video return score in range [0.0, 1.0]
-                    score = round(float(combined), 3)
-                    is_correct = combined >= 0.6
-                    missing = [k for k in expected_keywords if k.lower() not in transcript_clean]
-                    feedback = ""
-                    if matches == total:
-                        feedback = "All expected keywords present"
-                    else:
-                        feedback = f"Found {matches}/{total} keywords. Missing: {', '.join(missing)}"
-
-                    evaluation = {"score": score, "feedback": feedback, "is_correct": is_correct}
+                                evaluation["score"] = 0
+                        if "feedback" not in evaluation:
+                            evaluation["feedback"] = "No feedback"
+                        if "is_correct" not in evaluation:
+                            # Consider score >= 0.6 as correct
+                            try:
+                                evaluation["is_correct"] = float(evaluation["score"]) >= 0.6
+                            except Exception:
+                                evaluation["is_correct"] = False
                 except Exception:
                     evaluation = {"score": 0, "feedback": "Audio/video evaluation failed", "is_correct": False}
 

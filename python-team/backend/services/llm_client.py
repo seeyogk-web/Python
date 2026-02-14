@@ -160,7 +160,7 @@ def generate_question(skill: str, difficulty: str, qtype: str, options: int = 4)
 
 def evaluate_answer(question_type: str, question_text: str, correct_answer: str, candidate_answer: str):
     """
-    Evaluate MCQ or Coding question answers using LLM (OpenRouter).
+    Evaluate MCQ, Coding, Audio, or Video question answers using LLM (OpenRouter).
     Returns a structured JSON with evaluation result.
     """
 
@@ -187,6 +187,28 @@ def evaluate_answer(question_type: str, question_text: str, correct_answer: str,
             f"Candidate Code:\n{candidate_answer}\n"
             f"Evaluate correctness and efficiency. "
             f"Return JSON ONLY with keys: score (0-10), feedback (short explanation)."
+        )
+
+    elif question_type == "audio":
+        eval_prompt = (
+            f"You are an evaluator for audio interview answers.\n"
+            f"Question: {question_text}\n"
+            f"Ideal Answer Description: {correct_answer}\n"
+            f"Candidate's Transcribed Answer: {candidate_answer}\n"
+            f"Evaluate the candidate's answer for relevance, completeness, and clarity. "
+            f"Score from 0 (poor) to 5 (excellent). "
+            f"Return JSON ONLY with keys: score (0-5), feedback (short explanation)."
+        )
+
+    elif question_type == "video":
+        eval_prompt = (
+            f"You are an evaluator for video interview answers.\n"
+            f"Question: {question_text}\n"
+            f"Ideal Answer Description: {correct_answer}\n"
+            f"Candidate's Transcribed Answer: {candidate_answer}\n"
+            f"Evaluate the candidate's answer for relevance, communication, and depth. "
+            f"Score from 0 (poor) to 5 (excellent). "
+            f"Return JSON ONLY with keys: score (0-5), feedback (short explanation)."
         )
 
     else:
